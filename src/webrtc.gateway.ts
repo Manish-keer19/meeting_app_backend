@@ -5,8 +5,10 @@ import {
     MessageBody,
     ConnectedSocket,
     OnGatewayDisconnect,
+    OnGatewayConnection,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
+import { Logger } from '@nestjs/common';
 
 interface JoinRoomData {
     roomId: string;
@@ -32,16 +34,61 @@ interface IceCandidateData {
     candidate: any;
 }
 
-@WebSocketGateway({ cors: true })
-export class WebRtcGateway implements OnGatewayDisconnect {
+interface UserInfo {
+    roomId: string;
+    userName: string;
+    joinedAt: number;
+}
+
+// PERFORMANCE OPTIMIZATION: Use WebSocket compression and optimize transport
+@WebSocketGateway({
+    cors: true,
+    transports: ['websocket'], // Prefer WebSocket over polling for speed
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    perMessageDeflate: { // Enable compression for large messages
+        threshold: 1024, // Only compress messages > 1KB
+    },
+    maxHttpBufferSize: 1e8, // 100MB for large media
+})
+export class WebRtcGateway implements OnGatewayDisconnect, OnGatewayConnection {
     @WebSocketServer()
     server: Server;
 
-    // Store user information: socketId -> { roomId, userName }
-    private userInfo = new Map<string, { roomId: string; userName: string }>();
+    private readonly logger = new Logger(WebRtcGateway.name);
 
-    // Store room host: roomId -> socketId
+    // OPTIMIZED: Use Map for O(1) lookups instead of arrays
+    private userInfo = new Map<string, UserInfo>();
     private roomHosts = new Map<string, string>();
+
+    // PERFORMANCE: Cache room participants for faster lookups
+    private roomParticipants = new Map<string, Set<string>>();
+
+    // PERFORMANCE: Debounce timers for batch operations
+    private cleanupTimers = new Map<string, NodeJS.Timeout>();
+
+    // Connection tracking for rate limiting
+    private connectionAttempts = new Map<string, number[]>();
+
+    handleConnection(client: Socket) {
+        const ip = client.handshake.address;
+
+        // SECURITY & PERFORMANCE: Rate limiting
+        const now = Date.now();
+        const attempts = this.connectionAttempts.get(ip) || [];
+        const recentAttempts = attempts.filter(time => now - time < 60000); // Last minute
+
+        if (recentAttempts.length > 50) { // Max 50 connections per minute per IP
+            this.logger.warn(`Rate limit exceeded for IP: ${ip}`);
+            client.disconnect();
+            return;
+        }
+
+        recentAttempts.push(now);
+        this.connectionAttempts.set(ip, recentAttempts);
+
+        this.logger.log(`Client connected: ${client.id} from ${ip}`);
+    }
 
     @SubscribeMessage('join-room')
     handleJoin(
@@ -50,85 +97,92 @@ export class WebRtcGateway implements OnGatewayDisconnect {
     ) {
         const { roomId, userName } = data;
 
-        // Check if user already joined (prevent duplicates)
+        // PERFORMANCE: Check if user already joined (prevent duplicates)
         const existingUser = this.userInfo.get(client.id);
         if (existingUser && existingUser.roomId === roomId) {
-            console.log(`[WebRTC] ${userName} already in room ${roomId}, skipping duplicate join`);
+            this.logger.log(`${userName} already in room ${roomId}, skipping duplicate join`);
             return;
         }
 
-        console.log(`[WebRTC] ${userName} (${client.id}) attempting to join room: ${roomId}`);
+        this.logger.log(`${userName} (${client.id}) attempting to join room: ${roomId}`);
 
-        // Store user info temporarily (even if pending)
-        this.userInfo.set(client.id, { roomId, userName });
+        // OPTIMIZED: Store user info with timestamp for analytics
+        this.userInfo.set(client.id, {
+            roomId,
+            userName,
+            joinedAt: Date.now()
+        });
 
-        const room = this.server.sockets.adapter.rooms.get(roomId);
-        const numClients = room ? room.size : 0;
+        // PERFORMANCE: Use cached room size instead of querying adapter repeatedly
+        const participants = this.roomParticipants.get(roomId);
+        const numClients = participants ? participants.size : 0;
 
         if (numClients === 0) {
             // First user becomes host automatically
-            console.log(`[WebRTC] Room ${roomId} is empty. ${userName} is the new host.`);
+            this.logger.log(`Room ${roomId} is empty. ${userName} is the new host.`);
             this.roomHosts.set(roomId, client.id);
             this.joinRoom(client, roomId, userName);
         } else {
             // Room exists, ask host for permission
             const hostId = this.roomHosts.get(roomId);
 
-            // Fallback: If hostId is missing but room has people, pick the first one (shouldn't happen often)
-            const targetHostId = hostId || room?.values().next().value;
+            // PERFORMANCE: Fast lookup for host
+            const targetHostId = hostId || participants?.values().next().value;
 
             if (targetHostId) {
-                console.log(`[WebRTC] Room ${roomId} has host ${targetHostId}. Requesting permission for ${userName}.`);
+                this.logger.log(`Room ${roomId} has host ${targetHostId}. Requesting permission for ${userName}.`);
 
                 // Notify pending user they are waiting
                 client.emit('waiting-for-approval');
 
-                // Notify host
+                // Notify host (single emit, no broadcast)
                 this.server.to(targetHostId).emit('join-request', {
                     userId: client.id,
                     userName,
                 });
             } else {
-                // Should not happen if size > 0, but safety net: Join directly if no host found
-                console.warn(`[WebRTC] Room ${roomId} exists but no host found. Joining directly.`);
+                // Safety net: Join directly if no host found
+                this.logger.warn(`Room ${roomId} exists but no host found. Joining directly.`);
                 this.joinRoom(client, roomId, userName);
             }
         }
     }
 
     private joinRoom(client: Socket, roomId: string, userName: string) {
-        // Get existing users in room before joining
-        const room = this.server.sockets.adapter.rooms.get(roomId);
+        // PERFORMANCE: Use cached participants instead of querying adapter
+        const participants = this.roomParticipants.get(roomId) || new Set<string>();
         const existingUsers: Array<{ userId: string; userName: string }> = [];
 
-        if (room) {
-            room.forEach((socketId) => {
-                const userInfoData = this.userInfo.get(socketId);
-                if (userInfoData && socketId !== client.id) {
-                    existingUsers.push({
-                        userId: socketId,
-                        userName: userInfoData.userName,
-                    });
-                }
-            });
-        }
+        // OPTIMIZED: Build existing users list from cache
+        participants.forEach((socketId) => {
+            const userInfoData = this.userInfo.get(socketId);
+            if (userInfoData && socketId !== client.id) {
+                existingUsers.push({
+                    userId: socketId,
+                    userName: userInfoData.userName,
+                });
+            }
+        });
 
         // Join the room
         client.join(roomId);
 
-        // Send existing users to the new user
+        // PERFORMANCE: Update cache
+        participants.add(client.id);
+        this.roomParticipants.set(roomId, participants);
+
+        // Send existing users to the new user (single emit)
         if (existingUsers.length > 0) {
             client.emit('existing-users', existingUsers);
         }
 
-        // Notify all other users in the room about the new user
+        // OPTIMIZED: Notify all other users in the room about the new user (single broadcast)
         client.to(roomId).emit('user-joined', {
             userId: client.id,
             userName,
         });
 
-        const numClients = room ? room.size + 1 : 1;
-        console.log(`[WebRTC] ${userName} joined room ${roomId}. Total clients: ${numClients}`);
+        this.logger.log(`${userName} joined room ${roomId}. Total clients: ${participants.size}`);
     }
 
     @SubscribeMessage('admit-user')
@@ -187,13 +241,12 @@ export class WebRtcGateway implements OnGatewayDisconnect {
         @MessageBody() data: OfferData,
         @ConnectedSocket() client: Socket,
     ) {
-        const { to, offer, userName } = data;
-        console.log(`[WebRTC] Forwarding offer from ${userName} to ${to}`);
-
-        this.server.to(to).emit('offer', {
+        // PERFORMANCE: Direct forwarding without logging in production
+        // Use logger.debug for development only
+        this.server.to(data.to).emit('offer', {
             from: client.id,
-            offer,
-            userName,
+            offer: data.offer,
+            userName: data.userName,
         });
     }
 
@@ -202,12 +255,10 @@ export class WebRtcGateway implements OnGatewayDisconnect {
         @MessageBody() data: AnswerData,
         @ConnectedSocket() client: Socket,
     ) {
-        const { to, answer } = data;
-        console.log(`[WebRTC] Forwarding answer to ${to}`);
-
-        this.server.to(to).emit('answer', {
+        // PERFORMANCE: Fastest possible forwarding
+        this.server.to(data.to).emit('answer', {
             from: client.id,
-            answer,
+            answer: data.answer,
         });
     }
 
@@ -216,12 +267,11 @@ export class WebRtcGateway implements OnGatewayDisconnect {
         @MessageBody() data: IceCandidateData,
         @ConnectedSocket() client: Socket,
     ) {
-        const { to, candidate } = data;
-        console.log(`[WebRTC] Forwarding ICE candidate to ${to}`);
-
-        this.server.to(to).emit('ice-candidate', {
+        // PERFORMANCE: ICE candidates need to be forwarded ASAP
+        // No logging to maximize speed
+        this.server.to(data.to).emit('ice-candidate', {
             from: client.id,
-            candidate,
+            candidate: data.candidate,
         });
     }
 
@@ -238,13 +288,24 @@ export class WebRtcGateway implements OnGatewayDisconnect {
         @MessageBody() data: { roomId: string; kind: 'audio' | 'video'; isOn: boolean },
         @ConnectedSocket() client: Socket,
     ) {
-        const { roomId, kind, isOn } = data;
-        console.log(`[WebRTC] ${client.id} toggled ${kind} to ${isOn}`);
-
-        client.to(roomId).emit('media-status-update', {
+        // PERFORMANCE: Fast broadcast to room
+        client.to(data.roomId).emit('media-status-update', {
             userId: client.id,
-            kind,
-            isOn,
+            kind: data.kind,
+            isOn: data.isOn,
+        });
+    }
+
+    @SubscribeMessage('screen-share-status')
+    handleScreenShareStatus(
+        @MessageBody() data: { roomId: string; isSharing: boolean },
+        @ConnectedSocket() client: Socket,
+    ) {
+        // PERFORMANCE: Fast broadcast for screen sharing
+        client.to(data.roomId).emit('participant-screen-share', {
+            userId: client.id,
+            userName: this.userInfo.get(client.id)?.userName,
+            isSharing: data.isSharing,
         });
     }
 
@@ -253,35 +314,93 @@ export class WebRtcGateway implements OnGatewayDisconnect {
         if (userInfoData) {
             this.handleUserLeave(client, userInfoData.roomId);
         }
-        // Also cleanup if they were just connected but not fully joined/tracked in userInfo logic needed?
-        // userInfo is set on join attempt, so it should be there.
+
+        // PERFORMANCE: Cleanup connection tracking
+        this.cleanupConnectionTracking();
     }
 
     private handleUserLeave(client: Socket, roomId: string) {
         const userInfoData = this.userInfo.get(client.id);
-        console.log(`[WebRTC] ${userInfoData?.userName || 'User'} leaving room: ${roomId}`);
+        this.logger.log(`${userInfoData?.userName || 'User'} leaving room: ${roomId}`);
+
+        // PERFORMANCE: Update cache first
+        const participants = this.roomParticipants.get(roomId);
+        if (participants) {
+            participants.delete(client.id);
+            if (participants.size === 0) {
+                // MEMORY: Clean up empty room cache
+                this.roomParticipants.delete(roomId);
+            } else {
+                this.roomParticipants.set(roomId, participants);
+            }
+        }
 
         client.leave(roomId);
+
+        // OPTIMIZED: Single broadcast to notify others
         client.to(roomId).emit('user-left', {
             userId: client.id,
             userName: userInfoData?.userName,
         });
 
+        // MEMORY: Clean up user info
         this.userInfo.delete(client.id);
 
-        // Check if host left
+        // PERFORMANCE: Check if host left and reassign efficiently
         if (this.roomHosts.get(roomId) === client.id) {
-            const room = this.server.sockets.adapter.rooms.get(roomId);
-            if (room && room.size > 0) {
-                // Assign new host (next available user)
-                const newHostId = room.values().next().value;
+            if (participants && participants.size > 0) {
+                // Assign new host from cache (O(1) operation)
+                const newHostId = participants.values().next().value;
                 this.roomHosts.set(roomId, newHostId);
-                console.log(`[WebRTC] Host left room ${roomId}. New host is ${newHostId}`);
-                // Optional: Notify new host they are the host now
+                this.logger.log(`Host left room ${roomId}. New host is ${newHostId}`);
+
+                // Notify new host
+                this.server.to(newHostId).emit('host-assigned', { roomId });
             } else {
+                // MEMORY: Clean up empty room
                 this.roomHosts.delete(roomId);
-                console.log(`[WebRTC] Room ${roomId} is now empty. Cleared host.`);
+                this.logger.log(`Room ${roomId} is now empty. Cleared host.`);
             }
         }
+
+        // PERFORMANCE: Debounced cleanup for empty rooms
+        this.scheduleRoomCleanup(roomId);
+    }
+
+    // PERFORMANCE: Debounced cleanup to avoid frequent operations
+    private scheduleRoomCleanup(roomId: string) {
+        // Clear existing timer
+        const existingTimer = this.cleanupTimers.get(roomId);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+        }
+
+        // Schedule cleanup after 30 seconds of inactivity
+        const timer = setTimeout(() => {
+            const participants = this.roomParticipants.get(roomId);
+            if (!participants || participants.size === 0) {
+                this.roomParticipants.delete(roomId);
+                this.roomHosts.delete(roomId);
+                this.cleanupTimers.delete(roomId);
+                this.logger.log(`Cleaned up empty room: ${roomId}`);
+            }
+        }, 30000);
+
+        this.cleanupTimers.set(roomId, timer);
+    }
+
+    // MEMORY: Periodic cleanup of old connection attempts
+    private cleanupConnectionTracking() {
+        const now = Date.now();
+        const oneHourAgo = now - 3600000;
+
+        this.connectionAttempts.forEach((attempts, ip) => {
+            const recentAttempts = attempts.filter(time => time > oneHourAgo);
+            if (recentAttempts.length === 0) {
+                this.connectionAttempts.delete(ip);
+            } else {
+                this.connectionAttempts.set(ip, recentAttempts);
+            }
+        });
     }
 }
